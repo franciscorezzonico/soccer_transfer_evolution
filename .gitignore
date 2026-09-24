@@ -1,0 +1,11 @@
+# Raw source data (download separately from the Kaggle dataset)
+data/raw/football_transfers_2009_2021.csv
+
+# Quarto render caches and intermediate output
+.quarto/
+*_files/
+*.utf8.md
+
+# Operating system files
+.DS_Store
+Thumbs.db

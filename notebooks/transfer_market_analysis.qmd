@@ -1,0 +1,994 @@
+---
+title: "European Football Transfer Market Analysis"
+subtitle: "Transfer-Fee Inflation, League Premiums, and Player-Profile Effects (2009–2021)"
+author: "Francisco Rezzonico"
+date: last-modified
+date-format: "MMMM D, YYYY"
+format:
+  html:
+    embed-resources: true
+    toc: true
+    toc-title: "Contents"
+    toc-location: left
+    number-sections: true
+    code-fold: true
+    code-summary: "Show code"
+    fig-width: 10
+    fig-height: 6
+    fig-align: center
+    theme: cosmo
+  pdf: 
+    toc: true
+    number-sections: true
+
+execute:
+  echo: true
+  warning: false
+  message: false
+
+editor: visual 
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  fig.width = 10,
+  fig.height = 6
+)
+```
+
+```{r packages, echo=FALSE}
+# Load packages for data wrangling, cleaning, summary statistics, time-series 
+# handling, visualization formatting, and creating statistical tables.
+library(tidyverse)  
+library(scales)      
+library(janitor)     
+library(skimr) 
+library(zoo)
+library(stargazer)
+library(forcats)
+library(broom)
+```
+
+# Data Preparation
+
+This section documents how the raw football-transfer data were transformed into an analytical dataset suitable for statistical modeling and Tableau visualization. The goal is to retain comparable, paid incoming transfers while removing records that do not represent permanent player acquisitions or contain implausible values.
+
+## Data source and scope
+
+The source dataset is the [Football Transfer Dataset on Kaggle](https://www.kaggle.com/datasets/mexwell/football-transfer-dataset). It contains player attributes, transfer details, club context, and fee information for transactions involving seven major European leagues from 2009 through 2021.
+
+The raw file contains records from both perspectives of a transfer: the acquiring club (`dir = "in"`) and the releasing club (`dir = "out"`). Because this project studies the amount paid by clubs to acquire players, the final analytical sample retains only incoming records. The analysis focuses on paid, permanent transfers and therefore excludes loans, loan-end records, retirements, free transfers, and transfers without a reported fee.
+
+```{r load-data}
+# Import the raw transfer dataset and standardize column names for consistency.
+transfers_raw <- read_csv(
+  "../data/raw/soccer_transfers_2009_2021.csv",
+  show_col_types = FALSE
+) %>%
+  janitor::clean_names()
+
+# Summarize the dataset's size, time coverage, and league representation.
+raw_overview <- transfers_raw %>%
+  summarise(
+    records = n(),
+    variables = ncol(transfers_raw),
+    first_season = min(season, na.rm = TRUE),
+    last_season = max(season, na.rm = TRUE),
+    leagues = n_distinct(league)
+  )
+
+# Display the dataset overview as a formatted table.
+knitr::kable(
+  raw_overview,
+  col.names = c("Records", "Variables", "First season", "Last season", "Leagues"),
+  caption = "Raw dataset overview"
+)
+```
+
+## Initial data-quality review
+
+Before filtering, the dataset is reviewed for variable types, missing values, and implausible entries. This check is particularly important for player age and transfer fee because they are central to the analysis.
+
+```{r data-quality-review}
+# Review descriptive statistics, data types, and missingness for key transfer
+# related variables.
+transfers_raw %>%
+  select(
+    season,
+    league,
+    dir,
+    player_age,
+    player_pos,
+    window,
+    transfer_fee_amnt,
+    is_free,
+    is_loan,
+    is_loan_end,
+    is_retired
+  ) %>%
+  skim()
+
+# Count missing values for every variable and rank them from most to least 
+# missing.
+missingness_summary <- transfers_raw %>%
+  summarise(
+    across(
+      everything(),
+      ~ sum(is.na(.x))
+    )
+  ) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "missing_values"
+  ) %>%
+  arrange(desc(missing_values))
+
+# Display the ten variables with the highest number of missing values.
+knitr::kable(
+  head(missingness_summary, 10),
+  col.names = c("Variable", "Missing values"),
+  caption = "Ten variables with the most missing values in the raw dataset"
+)
+```
+
+## Analytical sample construction
+
+The data-cleaning pipeline uses explicit, sequential filters so the final sample can be reproduced and audited. The following decisions are applied:
+
+- Retain incoming transfers only, so each observation reflects a buying club's acquisition.
+- Exclude loans, loan-end records, and retirements because they do not represent comparable permanent acquisitions.
+- Retain players aged 16 to 40. This removes implausible values while preserving the plausible professional-player range.
+- Retain transfers with a positive, non-missing fee. Free transfers and transactions without a reported fee are outside the scope of paid-transfer analysis.
+- Exclude fee values above €222 million, the original project's upper cutoff for extreme outliers.
+
+Boolean fields are converted before filtering. This avoids treating character values such as `"TRUE"` and `"FALSE"` inconsistently across software environments.
+
+```{r prepare-boolean-fields}
+# Convert transfer-status indicators to logical variables for consistent analysis.
+transfers_typed <- transfers_raw |>
+  mutate(
+    is_loan = as.logical(is_loan),
+    is_loan_end = as.logical(is_loan_end),
+    is_retired = as.logical(is_retired),
+    is_free = as.logical(is_free)
+  )
+```
+
+```{r cleaning-audit}
+# Track how many records remain after each data-cleaning rule used to construct
+# the analytical sample, including transfer direction, transfer type, player 
+# age, reported fees, and removal of extreme fee values above €222 million.
+cleaning_audit <- tibble(
+  stage = c(
+    "Raw transfer records",
+    "Incoming transfers only",
+    "Exclude loans, loan ends, and retirements",
+    "Retain plausible player ages (16–40)",
+    "Retain paid transfers with reported fees",
+    "Remove transfers above €222M"
+  ),
+  records = c(
+    nrow(transfers_typed),
+    transfers_typed %>%
+      filter(dir == "in") %>%
+      nrow(),
+    transfers_typed %>%
+      filter(
+        dir == "in",
+        !is_loan,
+        !is_loan_end,
+        !is_retired
+      ) %>%
+      nrow(),
+    transfers_typed %>%
+      filter(
+        dir == "in",
+        !is_loan,
+        !is_loan_end,
+        !is_retired,
+        between(player_age, 16, 40)
+      ) %>%
+      nrow(),
+    transfers_typed %>%
+      filter(
+        dir == "in",
+        !is_loan,
+        !is_loan_end,
+        !is_retired,
+        between(player_age, 16, 40),
+        !is.na(transfer_fee_amnt),
+        transfer_fee_amnt > 0
+      ) %>%
+      nrow(),
+    transfers_typed %>%
+      filter(
+        dir == "in",
+        !is_loan,
+        !is_loan_end,
+        !is_retired,
+        between(player_age, 16, 40),
+        !is.na(transfer_fee_amnt),
+        transfer_fee_amnt > 0,
+        transfer_fee_amnt <= 222000000
+      ) %>%
+      nrow()
+  )
+) %>%
+  mutate(
+    records_removed = lag(records) - records,
+    pct_retained_from_raw = records / first(records) * 100
+  )
+
+# Display the number and percentage of records retained at each processing stage.
+knitr::kable(
+  cleaning_audit,
+  digits = 1,
+  col.names = c(
+    "Processing stage",
+    "Records retained",
+    "Records removed",
+    "% of raw records retained"
+  ),
+  caption = "Analytical sample construction audit"
+)
+```
+
+## Variable engineering and final cleaning
+
+The final transformation creates analysis-ready variables for transfer window, transfer timing, player position, and league name. Detailed positions are mapped to four broader groups—Forward, Midfielder, Defender, and Goalkeeper—to support interpretable comparisons. A `transfer_month_year` field is also created for time-based visualizations, using January for winter windows and June for summer windows.
+
+The league labels are standardized for readable reporting and Tableau display. The Premier League is placed first because it is used as the reference category in the later league-fee regression model.
+
+```{r create-analytical-dataset}
+# Create the final analytical dataset by retaining paid incoming transfers,
+# excluding loans, loan endings, retirements, implausible player ages, missing fees,
+# and transfer fees above €222 million. Then create analysis-ready variables for
+# transfer timing, player position, and league names.
+transfers_clean <- transfers_typed %>%
+  filter(
+    dir == "in",
+    !is_loan,
+    !is_loan_end,
+    !is_retired,
+    between(player_age, 16, 40),
+    !is.na(transfer_fee_amnt),
+    transfer_fee_amnt > 0,
+    transfer_fee_amnt <= 222000000
+  ) %>%
+  mutate(
+    transfer_window = recode(
+      window,
+      "s" = "Summer",
+      "w" = "Winter",
+      .default = window
+    ),
+    transfer_month = if_else(
+      transfer_window == "Winter",
+      "January",
+      "June"
+    ),
+    transfer_month_year = as.yearmon(
+      paste(transfer_month, season)
+    ),
+    position_group = case_when(
+      player_pos %in% c("attack", "CF", "RW", "SS", "LW") ~ "Forward",
+      player_pos %in% c("AM", "RM", "CM", "DM", "LM") ~ "Midfielder",
+      player_pos %in% c("CB", "LB", "RB") ~ "Defender",
+      TRUE ~ "Goalkeeper"
+    ),
+    league_name = recode(
+      league,
+      "GB1" = "Premier League",
+      "ES1" = "La Liga",
+      "IT1" = "Serie A",
+      "L1" = "Bundesliga",
+      "FR1" = "Ligue 1",
+      "PO1" = "Primeira Liga",
+      "NL1" = "Eredivisie",
+      .default = league
+    ),
+    league_name = factor(
+      league_name,
+      levels = c(
+        "Premier League",
+        "La Liga",
+        "Serie A",
+        "Bundesliga",
+        "Ligue 1",
+        "Primeira Liga",
+        "Eredivisie"
+      )
+    ),
+    position_group = factor(
+      position_group,
+      levels = c("Forward", "Midfielder", "Defender", "Goalkeeper")
+    )
+  ) %>%
+  arrange(transfer_month_year)
+
+analysis_overview <- transfers_clean |>
+  summarise(
+    paid_incoming_transfers = n(),
+    seasons_covered = paste(min(season), "–", max(season)),
+    leagues_covered = n_distinct(league_name),
+    median_transfer_fee = median(transfer_fee_amnt),
+    mean_transfer_fee = mean(transfer_fee_amnt)
+  ) |>
+  mutate(
+    median_transfer_fee = scales::label_currency(
+      prefix = "€",
+      scale = 1e-6,
+      suffix = "M",
+      accuracy = 0.01
+    )(median_transfer_fee),
+    mean_transfer_fee = scales::label_currency(
+      prefix = "€",
+      scale = 1e-6,
+      suffix = "M",
+      accuracy = 0.01
+    )(mean_transfer_fee)
+  )
+
+# Summarize the size, time period, league coverage, and fee distribution
+# of the final analytical dataset.
+knitr::kable(
+  analysis_overview,
+  col.names = c(
+    "Paid incoming transfers",
+    "Seasons covered",
+    "Leagues covered",
+    "Median fee",
+    "Mean fee"
+  ),
+  caption = "Final analytical dataset overview"
+)
+```
+
+## Export cleaned data
+
+The cleaned transfer-level dataset is exported for the Tableau dashboard and for downstream analysis. Keeping generated data in `data/processed/` makes the workflow clear: raw data remain unchanged, while all derivative files are produced by this report.
+
+```{r export-clean-data}
+# Export the cleaned analytical dataset for use in subsequent analysis and 
+# reporting.
+write_csv(
+  transfers_clean,
+  "../data/processed/paid_incoming_transfers_clean.csv"
+)
+```
+
+At the end of this preparation process, `transfers_clean` contains the portfolio project's final analytical sample. The next sections use this dataset to examine fee distributions, league differences, age and position patterns, and transfer-fee inflation over time.
+
+# Hypothesis Testing
+
+This section evaluates the three research hypotheses using the cleaned paid-transfer dataset created in the data-preparation workflow. Transfer fees are highly right-skewed, so the results should be interpreted as associations in observed fees rather than as causal estimates of player value. The models provide evidence on whether age, league, and time are systematically related to the fees paid by acquiring clubs.
+
+## Research hypotheses
+
+The analysis evaluates the following hypotheses:
+
+1. **Age relationship:** Player age is not linearly associated with transfer fee; instead, fees are expected to follow a nonlinear pattern that peaks during a player's prime years.
+2. **Premier League premium:** Premier League clubs pay higher transfer fees than clubs in the other leagues included in the dataset.
+3. **Transfer-fee inflation:** Paid transfer fees increased over the long run between 2009 and 2021, although seasonal fee levels may fluctuate.
+
+Before fitting the models, this section creates a log-transformed fee variable. The transformation does not replace analysis in euro amounts; instead, it provides a complementary view that reduces the influence of extremely high-value transfers and is useful when assessing growth over time.
+
+```{r model-data}
+# Prepare the modeling dataset by log-transforming transfer fees to reduce skewness
+# and setting the Premier League as the reference category for league comparisons.
+transfers_model <- transfers_clean %>%
+  mutate(
+    log_transfer_fee = log(transfer_fee_amnt),
+    league_name = fct_relevel(
+      league_name,
+      "Premier League"
+    )
+  )
+
+# Summarize the transfer-fee distribution in the dataset used for modeling.
+model_data_overview <- transfers_model %>%
+  summarise(
+    transfers = n(),
+    median_fee = median(transfer_fee_amnt),
+    mean_fee = mean(transfer_fee_amnt),
+    min_fee = min(transfer_fee_amnt),
+    max_fee = max(transfer_fee_amnt)
+  ) %>%
+  mutate(
+    across(
+      c(median_fee, mean_fee, min_fee, max_fee),
+      ~ label_currency(
+        prefix = "€",
+        scale = 1e-6,
+        suffix = "M",
+        accuracy = 0.01
+      )(.x)
+    )
+  )
+
+# Display a formatted summary of transfer fees in the modeling dataset.
+knitr::kable(
+  model_data_overview,
+  col.names = c(
+    "Transfers",
+    "Median fee",
+    "Mean fee",
+    "Minimum fee",
+    "Maximum fee"
+  ),
+  caption = "Transfer-fee distribution in the modeling dataset"
+)
+```
+
+## Hypothesis 1: Player age and transfer fee
+
+### Rationale and model specification
+
+A simple correlation only measures a straight-line relationship. It can therefore be close to zero even if transfer fees increase through early career years and decline after players pass their prime. To test this possibility, the analysis compares two nested ordinary least squares (OLS) models:
+
+$$\text{Fee}_i = \beta_0 + \beta_1\text{Age}_i + \varepsilon_i$$
+
+$$\text{Fee}_i = \beta_0 + \beta_1\text{Age}_i + \beta_2\text{Age}_i^2 + \varepsilon_i$$
+
+The first model captures a linear association. The second adds an age-squared term, allowing the relationship to curve. An ANOVA comparison tests whether the quadratic term improves model fit.
+
+```{r age-correlation-and models}
+# Test the strength and statistical significance of the linear association
+# between player age and transfer fee using Pearson's correlation.
+age_correlation_test <- cor.test(
+  ~ player_age + transfer_fee_amnt,
+  data = transfers_model,
+  method = "pearson"
+)
+
+# Estimate a linear regression model to evaluate the relationship between
+# player age and transfer fee.
+age_linear_model <- lm(
+  transfer_fee_amnt ~ player_age,
+  data = transfers_model
+)
+
+# Estimate a quadratic regression model to assess whether the relationship
+# between player age and transfer fee is non-linear.
+age_quadratic_model <- lm(
+  transfer_fee_amnt ~ player_age + I(player_age^2),
+  data = transfers_model
+)
+
+# Compare the nested linear and quadratic models to determine whether adding
+# the squared age term significantly improves model fit.
+age_model_comparison <- anova(
+  age_linear_model,
+  age_quadratic_model
+)
+
+# Create a formatted summary of the Pearson correlation coefficient and p-value.
+age_correlation_summary <- tibble(
+  measure = c("Pearson correlation", "Correlation test p-value"),
+  value = c(
+    unname(age_correlation_test$estimate),
+    age_correlation_test$p.value
+  )
+) %>%
+  mutate(
+    value = case_when(
+      measure == "Pearson correlation" ~ sprintf("%.4f", value),
+      TRUE ~ format.pval(value, digits = 3, eps = 0.001)
+    )
+  )
+
+# Display the correlation results in a formatted table.
+knitr::kable(
+  age_correlation_summary,
+  col.names = c("Measure", "Value"),
+  caption = "Linear association between player age and transfer fee"
+)
+
+# Display key goodness-of-fit and significance statistics for the linear age model.
+knitr::kable(
+  broom::glance(age_linear_model) %>%
+    select(r.squared, adj.r.squared, sigma, statistic, p.value, df, df.residual) |>
+    pivot_longer(
+      cols = everything(),
+      names_to = "metric",
+      values_to = "value"
+    ),
+  digits = 4,
+  caption = "Linear age model diagnostics"
+)
+
+# Display the ANOVA results comparing the linear and quadratic age models.
+knitr::kable(
+  age_model_comparison,
+  digits = 4,
+  caption = "ANOVA comparison of linear and quadratic age models"
+)
+```
+
+### Predicted age-fee relationship
+
+The figure below shows fitted values from the quadratic model across the observed age range. Predictions are calculated in euro amounts so the estimated relationship remains interpretable for a recruitment or financial-planning audience.
+
+```{r age-fee-curve, fig.cap="Predicted transfer fee by player age from the quadratic OLS model.", fig.width=9, fig.height=5}
+# Create a sequence of player ages spanning the observed range in the modeling dataset.
+# This sequence is used to estimate predicted transfer fees across the player life cycle.
+age_prediction_data <- tibble(
+  player_age = seq(
+    min(transfers_model$player_age),
+    max(transfers_model$player_age),
+    by = 0.1
+  )
+)
+
+# Generate predicted transfer fees and 95% confidence intervals from the quadratic age model.
+age_predictions <- predict(
+  age_quadratic_model,
+  newdata = age_prediction_data,
+  interval = "confidence"
+) %>%
+  as_tibble() %>%
+  bind_cols(age_prediction_data)
+
+# Visualize the estimated non-linear relationship between player age and transfer fees.
+# The shaded band represents the 95% confidence interval around the predicted values.
+ggplot(age_predictions, aes(x = player_age, y = fit)) +
+  geom_ribbon(
+    aes(ymin = lwr, ymax = upr),
+    fill = "#4C78A8",
+    alpha = 0.18
+  ) +
+  geom_line(
+    color = "#1F4E79",
+    linewidth = 1.1
+  ) +
+  scale_y_continuous(
+    labels = scales::label_currency(
+      prefix = "€",
+      scale = 1e-6,
+      suffix = "M"
+    )
+  ) +
+  labs(
+    title = "Estimated Transfer Fees Peak During Prime Playing Years",
+    subtitle = "Quadratic OLS estimates with 95% confidence interval",
+    x = "Player age",
+    y = "Predicted transfer fee"
+  )
+```
+
+### Interpretation
+
+The Pearson correlation describes the linear component of the age-fee relationship only. A near-zero correlation should not be interpreted as evidence that age is unrelated to fee. The ANOVA comparison is the primary test for this hypothesis: if the quadratic model significantly improves fit, the evidence supports a nonlinear age-price relationship. The sign and shape of the fitted curve indicate whether the pattern is consistent with an inverted U, with fees rising toward players' prime years and falling afterward.
+
+## Hypothesis 2: Premier League transfer-fee premium
+
+### Rationale and model specification
+
+To assess whether fee levels differ systematically across leagues, the analysis estimates an OLS model with league as a categorical predictor. The Premier League is the reference group, so each coefficient represents the estimated average difference in transfer fee between that league and the Premier League.
+
+$$\text{Fee}_i = \beta_0 + \sum_{l=1}^{L-1}\beta_l\text{League}_{il} + \varepsilon_i$$
+
+A negative and statistically significant coefficient for a league indicates a lower estimated average fee relative to the Premier League. This model is descriptive; it does not control for player ability, contract length, club revenue, or other factors that influence a specific transaction.
+
+```{r league-fee-model}
+# Estimate a regression model comparing average transfer fees across leagues,
+# using the Premier League as the reference group.
+league_fee_model <- lm(
+  transfer_fee_amnt ~ league_name,
+  data = transfers_model
+)
+
+# Extract model estimates, 95% confidence intervals, and p-values, then format
+# the results as euro values for clear comparison across leagues.
+league_model_results <- tidy(
+  league_fee_model,
+  conf.int = TRUE
+) %>%
+  mutate(
+    comparison = case_when(
+      term == "(Intercept)" ~ "Premier League estimated mean",
+      TRUE ~ str_remove(term, "league_name")
+    ),
+    across(
+      c(estimate, conf.low, conf.high),
+      ~ label_currency(
+        prefix = "€",
+        scale = 1e-6,
+        suffix = "M",
+        accuracy = 0.01
+      )(.x)
+    ),
+    p.value = format.pval(p.value, digits = 3, eps = 0.001)
+  ) %>%
+  select(comparison, estimate, conf.low, conf.high, p.value)
+
+# Display estimated league-level transfer-fee differences relative to the Premier League.
+knitr::kable(
+  league_model_results,
+  col.names = c(
+    "League comparison", "Estimated difference", "95% CI lower", "95% CI upper", "p-value"
+  ),
+  caption = "League-fee model results, with Premier League as the reference group"
+)
+```
+
+### League-level fee comparison
+
+The model estimates are complemented by a descriptive chart of median paid transfer fees. Medians are reported because the fee distribution is right-skewed and a small number of elite transactions can raise league-level means substantially.
+
+```{r league-fee-chart, fig.cap= "Median paid transfer fee by league", fig.width= 9, fig.height= 5}
+# Calculate the number of transfers and the median and mean transfer fees for each league.
+# Leagues are ordered from highest to lowest median transfer fee for comparison.
+league_fee_summary <- transfers_model %>%
+  group_by(league_name) %>%
+  summarise(
+    transfers = n(),
+    median_fee = median(transfer_fee_amnt),
+    mean_fee = mean(transfer_fee_amnt)
+  ) %>%
+  arrange(desc(median_fee))
+
+# Visualize median paid transfer fees across leagues.
+ggplot(
+  league_fee_summary,
+  aes(x = reorder(league_name, median_fee), y = median_fee)
+) +
+  geom_col(fill = "#E76F51") +
+  coord_flip() +
+  scale_y_continuous(
+    labels = scales::label_currency(
+      prefix = "€",
+      scale = 1e-6,
+      suffix = "M"
+    )
+  ) +
+  labs(
+    title = "Median Paid Transfer Fees Differ Across Leagues",
+    x = NULL,
+    y = "Median transfer fee"
+  )
+```
+
+### Interpretation
+
+The regression model evaluates whether observed fee differences relative to the Premier League are statistically distinguishable from zero. The descriptive median chart answers a related but different question: it displays the typical paid fee in each league. Both views are necessary because mean-based OLS estimates are sensitive to high-value deals, whereas medians are more resistant to outliers.
+
+## Hypothesis 3: Transfer-fee inflation over time
+
+### Rationale and measurement approach
+
+Transfer-fee inflation is assessed using both mean and median seasonal fees. Each measure is indexed to the first season in the sample, where the base season equals 100. The median index tracks changes in a typical paid transfer, while the mean index also reflects the influence of exceptionally expensive transfers.
+
+Season-over-season percentage changes are calculated for descriptive analysis. To compare broad time trends, the section also estimates a linear model of fees by season and a log-linear model of fees by season. The log-linear specification is useful because a linear change in logged fees corresponds approximately to a constant percentage change in fees.
+
+```{r seasonal-fee-index}
+# Calculate annual transfer-fee statistics and construct indices relative to the
+# first observed season (base = 100), along with year-over-year percentage changes.
+seasonal_fee_index <- transfers_model %>%
+  group_by(season) %>%
+  summarise(
+    transfers = n(),
+    median_fee = median(transfer_fee_amnt),
+    mean_fee = mean(transfer_fee_amnt)
+  ) %>%
+  arrange(season) %>%
+  mutate(
+    median_fee_index = median_fee / first(median_fee) * 100,
+    mean_fee_index = mean_fee / first(mean_fee) * 100,
+    median_fee_yoy_pct = (median_fee_index / lag(median_fee_index) - 1) * 100,
+    mean_fee_yoy_pct = (mean_fee_index / lag(mean_fee_index) - 1) * 100
+  )
+
+# Format seasonal transfer-fee values, indices, and annual percentage changes
+# for presentation in a summary table.
+seasonal_fee_display <- seasonal_fee_index %>%
+  transmute(
+    season,
+    transfers,
+    median_fee = label_currency(
+      prefix = "€", scale = 1e-6, suffix = "M", accuracy = 0.01
+    )(median_fee),
+    mean_fee = label_currency(
+      prefix = "€", scale = 1e-6, suffix = "M", accuracy = 0.01
+    )(mean_fee),
+    median_fee_index = round(median_fee_index, 1),
+    mean_fee_index = round(mean_fee_index, 1),
+    median_fee_yoy_pct = label_percent(
+      scale = 1, accuracy = 0.1
+    )(median_fee_yoy_pct),
+    mean_fee_yoy_pct = label_percent(
+      scale = 1, accuracy = 0.1
+    )(mean_fee_yoy_pct)
+  )
+
+# Display the seasonal fee measures and year-over-year changes in a formatted table.
+knitr::kable(
+  seasonal_fee_display,
+  col.names = c(
+    "Season", "Transfers", "Median fee", "Mean fee",
+    "Median index", "Mean index", "Median YoY", "Mean YoY"
+  ),
+  caption = "Seasonal transfer-fee indices and year-over-year changes"
+)
+```
+
+### Fee-inflation index
+
+```{r transfer-fee-index-chart, fig.cap= 'Mean and median paid transfer-fee indices, benchmarked to the first season = 100.', fig.width=9, fig.height=5}
+# Reshape median and mean transfer-fee indices into a long format and visualize
+# how both measures changed over time relative to the first season (base = 100).
+seasonal_fee_index %>%
+  select(season, median_fee_index, mean_fee_index) %>%
+  pivot_longer(
+    cols = c(median_fee_index, mean_fee_index),
+    names_to = "metric",
+    values_to = "index_value"
+  ) %>%
+  mutate(
+    metric = recode(
+      metric,
+      median_fee_index = "Median fee index",
+      mean_fee_index = "Mean fee index"
+    )
+  ) %>%
+  ggplot(aes(x = season, y = index_value, color = metric)) +
+  geom_hline(
+    yintercept = 100,
+    linetype = "dashed",
+    color = "gray55"
+  ) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2) +
+  scale_x_continuous(breaks = sort(unique(transfers_model$season))) +
+  scale_color_manual(values = c(
+    "Median fee index" = "#2A9D8F",
+    "Mean fee index" = "#E76F51"
+  )) +
+  labs(
+    title = "Transfer Fees Increased Relative to the Base Season",
+    subtitle = "First season in the dataset = 100",
+    x = "Season",
+    y = "Transfer-fee index",
+    color = NULL
+  )
+```
+
+### Linear and log-linear trend models
+
+```{r time-trend-models}
+# Estimate linear and log-linear regression models to evaluate how transfer fees
+# have changed over time. 
+fee_linear_trend_model <- lm(
+  transfer_fee_amnt ~ season,
+  data = transfers_model
+)
+
+fee_log_linear_trend_model <- lm(
+  log_transfer_fee ~ season,
+  data = transfers_model
+)
+
+# Compare overall fit and statistical significance between the linear and
+# log-linear transfer-fee trend models.
+trend_model_comparison <- bind_rows(
+  glance(fee_linear_trend_model) %>%
+    transmute(
+      model = "Linear: fee ~ season",
+      r_squared = r.squared,
+      adjusted_r_squared = adj.r.squared,
+      residual_standard_error = sigma,
+      model_p_value = p.value
+    ),
+  glance(fee_log_linear_trend_model) %>%
+    transmute(
+      model = "Log-linear: log(fee) ~ season",
+      r_squared = r.squared,
+      adjusted_r_squared = adj.r.squared,
+      residual_standard_error = sigma,
+      model_p_value = p.value
+    )
+) %>%
+  mutate(
+    across(
+      c(r_squared, adjusted_r_squared),
+      ~ round(.x, 4)
+    ),
+    model_p_value = format.pval(model_p_value, digits = 3, eps = 0.001)
+  )
+
+# Display a comparison of model fit statistics for the two time-trend specifications.
+knitr::kable(
+  trend_model_comparison,
+  col.names = c(
+    "Model", "R-squared", "Adjusted R-squared",
+    "Residual standard error", "Model p-value"
+  ),
+  caption = "Comparison of linear and log-linear time-trend models"
+)
+
+# Convert the season coefficient from the log-linear model into an estimated
+# annual percentage change in transfer fees, including its 95% confidence interval.
+log_trend_coefficient <- tidy(fee_log_linear_trend_model) %>%
+  filter(term == "season") %>%
+  transmute(
+    estimated_annual_pct_change = (exp(estimate) - 1) * 100,
+    lower_95_pct = (exp(confint(fee_log_linear_trend_model)["season", 1]) - 1) * 100,
+    upper_95_pct = (exp(confint(fee_log_linear_trend_model)["season", 2]) - 1) * 100
+  )
+
+# Display the estimated annual percentage change implied by the log-linear model.
+knitr::kable(
+  log_trend_coefficient,
+  digits = 2,
+  col.names = c(
+    "Estimated annual % change", "95% CI lower", "95% CI upper"),
+  caption = "Estimated annual change from the log-linear fee model"
+)
+```
+
+### Export Tableau-ready inflation data
+
+The season-level index is exported separately so the Tableau workbook can use a consistent, reproducible source for fee-inflation visualizations and KPI calculations.
+
+```{r export-seasonal-index}
+# Export the seasonal transfer-fee index for use in later analysis or reporting.
+readr::write_csv(
+  seasonal_fee_index,
+  "../data/processed/transfer_fee_inflation_index.csv"
+)
+```
+
+### Interpretation
+
+A sustained increase in either index above 100 indicates that transfer fees are higher than in the base season. Comparing the median and mean indices reveals whether growth is broad-based or disproportionately driven by expensive deals. The time-trend models provide complementary evidence: the linear model estimates a constant euro change per season, while the log-linear model estimates an approximately constant percentage change. Neither model, by itself, establishes that time causes changes in fees; transfer-market conditions, player quality, broadcasting revenue, and club strategy are not directly controlled in these specifications.
+
+## Hypothesis-testing summary
+
+The analysis produces the following conclusions:
+
+1. **Nonlinear age-fee relationship — supported.** Player age does not have a statistically significant linear relationship with transfer fee (\(r = 0.0090\), \(p = 0.443\)). However, adding a quadratic age term improves model fit significantly, \(F(1, 7200) = 65.46\), \(p < .001\). Predicted fees peak at approximately 24.9 years of age, supporting an inverted-U pattern.
+
+2. **Premier League premium — supported.** The Premier League had the highest estimated mean paid transfer fee (€11.75M). Each other league had a statistically significant lower estimated mean fee relative to the Premier League (\(p < .001\) for all comparisons). The Premier League also had the highest median fee (€6.75M).
+
+3. **Long-run transfer-fee inflation — supported, with volatility.** Median fees increased from €2.50M in 2009 to €3.82M in 2021, while mean fees increased from €4.55M to €8.30M. The log-linear model estimates average annual growth of 8.75% and fits the data slightly better than the level model. However, both mean and median fees declined after their 2019 peak, so the pattern is better described as long-run inflation with cyclical or event-related fluctuations rather than steady growth every year.
+
+Taken together, the results show that transfer fees depend on market context, player profile, and time.
+
+# Key Findings and Business Implications
+
+This section translates the statistical analysis into decision-relevant insights for football recruitment, squad planning, and transfer-market benchmarking. The results describe patterns in comparable, paid incoming transfers across seven European leagues from 2009 through 2021. They should be used as market context rather than as a standalone model of an individual player's value.
+
+## Market inflation was substantial but uneven
+
+Transfer fees increased substantially over the full study period, although the increase was not consistent from one season to the next. The median paid fee rose from **€2.50M in 2009** to **€3.82M in 2021**, a 52.8% increase. Over the same period, the mean paid fee rose from **€4.55M** to **€8.30M**, an 82.4% increase.
+
+The larger increase in the mean is important because transfer fees are strongly right-skewed. A small number of exceptionally expensive transfers can move the average much more than they move the typical transaction. For this reason, recruitment and finance teams should use median fees alongside mean fees when benchmarking historical spending.
+
+The highest values occurred in 2019, when the median fee reached **€5.00M** and the mean reached **€10.54M**. Both measures subsequently declined: the median fell 20.0% and the mean fell 17.8% in 2020, followed by smaller declines in 2021. The evidence therefore supports long-run inflation with meaningful market volatility, rather than uninterrupted year-over-year growth.
+
+### Implication
+
+Historical fees should be adjusted for market conditions before they are used to set acquisition budgets. A player purchased for €3M in an earlier season should not automatically be considered comparable to a €3M target in a later market. At the same time, clubs should avoid treating blockbuster transactions as the standard market price; median-based benchmarks provide a more stable view of typical paid transfers.
+
+## Premier League clubs paid the strongest premium
+
+The Premier League had the highest estimated mean fee in the sample, approximately **€11.75M** per paid incoming transfer, and the highest median fee, **€6.75M**. The league regression model found that every other league had a statistically significant lower estimated mean fee relative to the Premier League ($p <0.001$ for each comparison).
+
+The estimated mean-fee differences relative to the Premier League were €3.68M lower for La Liga, €6.39M lower for Ligue 1, €6.58M lower for the Bundesliga, €6.58M lower for Serie A, €8.56M lower for Primeira Liga, and €9.80M lower for the Eredivisie. These differences are consistent with a persistent Premier League purchasing-power premium during the study period.
+
+### Implication
+
+Clubs should not evaluate transfer prices with a single cross-league benchmark. League-specific reference ranges are more informative: a fee that is typical for a Premier League acquisition may represent a substantial premium in another league. For clubs selling to Premier League buyers, this pattern may also indicate opportunities to capture higher value when a player profile is in demand.
+
+## Fees peak near prime age and vary by position
+
+The age analysis found no statistically significant *linear* relationship between player age and transfer fee ($r = 0.0090$, $p = 0.443$). However, the quadratic model significantly improved on the linear-only model ($F(1, 7200) = 65.46$, $p < .001$), indicating that age has a nonlinear association with fee. The fitted quadratic curve reaches its estimated maximum at approximately **24.9 years of age**.
+
+Position also matters. In the cleaned dataset, forwards had the highest median fee (**€3.40M**) and mean fee (**€7.83M**), followed by midfielders (median **€3.00M**; mean **€6.58M**), defenders (median **€2.50M**; mean **€5.53M**), and goalkeepers (median **€1.95M**; mean **€4.13M**).
+
+### Implication
+
+Recruitment teams should use age and position-aware benchmarks rather than treating all targets as comparable. The broad market pattern suggests that fees are highest for players near their prime years, while forwards and midfielders require higher expected acquisition budgets. This does not mean that every player should be bought before age $25$ or sold afterward; performance, contract status, tactical fit, injury history, and resale potential remain central to individual decisions.
+
+## Recommended decision framework
+
+The findings support the following practical approach to transfer-market planning:
+
+1. **Use league-specific fee benchmarks.** Compare a potential fee to historical deals in the buyer's league and target player's source market, not only to a Europe-wide average.
+2. **Use median and mean benchmarks together.** The median captures typical paid transfers, while the mean reflects the financial impact of elite and outlier transactions.
+3. **Budget by role.** Build higher expected fee ranges for forwards and midfielders than for comparable defenders and goalkeepers.
+4. **Account for age-price dynamics.** Evaluate whether a target is entering, within, or beyond the broad peak-fee period, while accounting for player-specific evidence.
+5. **Inflation-adjust historical comparisons.** Update past transfer benchmarks for market-wide price movement before applying them to current recruitment decisions.
+
+# Tableau Dashboard
+
+## Dashboard purpose
+
+The Tableau dashboard makes the project findings accessible through interactive, filterable visual analysis. It is designed for users who want to examine transfer-market patterns without running the R/Quarto workflow. Users can filter the dashboard by aggregation method, season, league, and position group to compare market behavior across different slices of the data.
+
+The dashboard includes four KPI cards:
+
+- **Total Transfer Expenditure**
+- **Median or mean Transfer Fee**, depending on the selected aggregation
+- **Number of Transactions**
+- **Most Transferred Position**
+
+It also includes three linked analytical views:
+
+- A time-series chart of transfer fees by league from 2009 to 2021.
+- A bar chart of transfer fees by position group.
+- An age-based view showing how median transfer fees vary across player ages.
+
+## Dashboard preview
+
+![Tableau dashboard preview showing the 2010 median-fee view across all leagues and positions.](../tableau/dashboard_preview.png){fig-alt="Tableau dashboard titled Soccer Transfer Evolution. It contains transfer KPIs, a multi-league time-series chart, a position-group bar chart, and an age-based bar chart."}
+
+*Figure: Tableau dashboard preview. The displayed state uses median aggregation, the 2010 season, all leagues, and all position groups.*
+
+In the displayed 2010 view, the dashboard reports total transfer expenditure of **€1.93B**, a median transfer fee of **€2.00M**, and **480** paid incoming transfers. Forwards were the most frequently transferred position group, with **182 transactions**.
+
+# Limitations
+
+This project provides descriptive and inferential evidence about historical paid transfer activity, but several limitations affect how the results should be interpreted.
+
+- **Scope of leagues and seasons:** The data cover seven major European leagues and transfer seasons from 2009 through 2021. Findings may not generalize to other leagues, women’s football, lower divisions, or post-2021 market conditions.
+- **Player value is not fully modeled:** The models do not directly control for player performance, playing time, injuries, contract duration, salary, release clauses, agent effects, nationality, club revenue, team need, or bargaining conditions. The estimated associations should not be interpreted as causal player valuations.
+- **Selection criteria:** The analytical dataset intentionally excludes free transfers, loans, loan-end records, retirements, missing-fee observations, implausible ages, and fees above €222M. Results therefore describe comparable paid incoming transfers rather than all player movement.
+- **Right-skewed fee distribution:** A small number of high-value deals disproportionately affect mean fees and OLS results estimated in euro amounts. The report addresses this by reporting medians and by evaluating a log-linear time model, but skewness remains relevant when interpreting league and individual-fee estimates.
+- **Time trends are incomplete explanations:** Season is statistically associated with transfer fee, but it explains only a modest share of individual fee variation. Market inflation can reflect changes in player quality, broadcasting revenue, ownership investment, financial regulation, exchange rates, and the composition of transfers in a given year.
+- **Post-2019 volatility:** Fees declined after the 2019 peak. As a result, the observed 2009–2021 trend should not be mechanically extrapolated to later seasons without updated data and additional market context.
+
+# Conclusion
+
+This project shows that paid football transfer fees increased materially across the seven European leagues studied between 2009 and 2021, but the market did not rise at a uniform rate every year. The median fee increased from €2.50M to €3.82M, while the mean fee increased from €4.55M to €8.30M. The gap between these changes demonstrates the increasing influence of high-value transactions on average market costs.
+
+The analysis also identifies meaningful differences across player profiles and leagues. The Premier League had the highest fee levels, with an estimated mean fee of €11.75M and a median of €6.75M. Player age followed a nonlinear pattern, with predicted fees peaking at approximately 24.9 years, and forwards and midfielders commanded higher typical fees than defenders and goalkeepers.
+
+For recruitment and financial-planning teams, these findings support league-specific benchmarks, age- and position-aware budget ranges, and inflation-adjusted comparisons of past transfer activity. The Tableau dashboard extends these insights through interactive exploration of season, league, position, and aggregation choices. The results are best used as a market-context tool alongside richer player-level valuation methods that incorporate performance, contract, financial, and tactical information.
+
+# Reproducibility and Data Source
+
+## Data source
+
+The raw data were obtained from the [Football Transfer Dataset on Kaggle](https://www.kaggle.com/datasets/mexwell/football-transfer-dataset).
+
+## Technical environment
+
+- **Analysis and reporting:** R and Quarto
+- **Data manipulation:** `tidyverse`, `janitor`, `skimr`, `zoo`, `scales`, `broom`, and `here`
+- **Visualization:** Tableau
+- **Analytical sample:** 7,203 paid incoming transfers
+- **Time period:** 2009–2021
+- **League coverage:** Premier League, La Liga, Serie A, Bundesliga, Ligue 1, Primeira Liga, and Eredivisie
+
+## Reproduce the analysis
+
+1. Place the raw CSV at `data/raw/football_transfers_2009_2021.csv`.
+2. Render `analysis/transfer_market_analysis.qmd` from the repository root.
+3. The report writes the cleaned transfer-level data to `data/processed/paid_incoming_transfers_clean.csv`.
+4. The report writes the seasonal fee index to `data/processed/transfer_fee_inflation_index.csv`.
+5. Open `tableau/european_transfer_market_dashboard.twbx`, refresh its data source if needed, and publish a public-safe version to Tableau Public for website embedding.
+
+## Project assets
+
+```text
+analysis/transfer_market_analysis.qmd
+    Reproducible data preparation, statistical analysis, and report rendering
+
+data/processed/paid_incoming_transfers_clean.csv
+    Cleaned transfer-level dataset for analysis and Tableau
+
+data/processed/transfer_fee_inflation_index.csv
+    Season-level mean and median fee indices and year-over-year changes
+
+tableau/european_transfer_market_dashboard.twbx
+    Tableau packaged workbook
+
+tableau/dashboard_preview.jpg
+    Static dashboard preview used in the Quarto report and repository README
+```
