@@ -1,2 +1,8 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Classify R-based Quarto source documents as R
+*.qmd linguist-language=R
+
+# Exclude rendered HTML reports from language statistics
+*.html linguist-generated=true
